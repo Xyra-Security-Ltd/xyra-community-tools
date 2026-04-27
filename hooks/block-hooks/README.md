@@ -119,30 +119,47 @@ This is a Codex CLI platform limitation, not a bug in this tool. Cursor and Clau
 
 ### Pattern matching
 
-The hook uses substring matching to detect keywords from `keywords.txt`. It will block any command containing those exact strings. 
+The hook uses **exact token matching** to detect keywords from `keywords.txt`. Keywords must appear as distinct tokens (words) in the command, not as substrings within other words.
 
-**Example:** If `keywords.txt` contains `deleteVolume`, these will be blocked:
-- Direct GraphQL mutations: `mutation { deleteVolume(...) }`
-- API calls: `curl ... -d '{"query":"mutation { deleteVolume ..."}'`
-- Comments/strings: `# deleteVolume is dangerous` (also blocked)
+**Example:** If `keywords.txt` contains `deleteVolume`:
 
-**It will not block:**
-- Base64-encoded commands (agents rarely use this)
-- Operations renamed via aliasing at the API provider level
-- Operations performed through web UIs (this is agent-level protection only)
-- Typos or variations not in your keywords.txt (`delVolume`, `delete_vol`, etc.)
+✅ **WILL block:**
+- `deleteVolume myvolume`
+- `echo "deleteVolume"`
+- GraphQL: `mutation { deleteVolume(id: "xyz") }`
+- API: `curl ... -d '{"action": "deleteVolume"}'`
+
+❌ **WILL NOT block:**
+- `deleteVolumeNow` (different word)
+- `myDeleteVolume` (different word)
+- `undeleteVolume` (different word)
+- Base64-encoded commands
+- Typos: `delteVolume`, `delete_volume`
+
+**This is different from substring matching:** The keyword `delete` will NOT block `deleteVolume` or `undelete`. Each keyword is matched as a complete token.
+
+**Matching contexts:**
+The hook checks for keywords in several contexts:
+- As quoted strings: `"keyword"`
+- With spaces around them: ` keyword `
+- At the start/end of commands: `keyword ...` or `... keyword`
 
 ### False positives and keyword selection
 
-**Keywords are explicit** — only the exact strings in `keywords.txt` are blocked. This minimizes false positives but requires you to add all variants you want to block.
+**Keywords must be exact tokens** — only complete words matching your keywords.txt entries are blocked. This minimizes false positives while still requiring you to list all variants you want to block.
 
-**Tips for minimizing false positives:**
-- Be specific: `volumeDelete` not just `delete`
+**Tips for choosing keywords:**
+- Use full command names: `deleteVolume` not `delete` (too broad)
+- Add common variants if needed: `deleteVolume`, `delete-volume`, `volume-delete`  
 - Test thoroughly after adding new keywords
-- Check logs regularly: `grep "BLOCK" ~/.agent-hooks/agent-hooks.log`
-- If you encounter a false positive, remove or refine the keyword and reinstall
+- Check logs: `grep "BLOCK" ~/.agent-hooks/agent-hooks.log`
 
-If you encounter a false positive, check the logs and file an issue with the command that was incorrectly blocked.
+**Keywords will NOT block:**
+- Operations through web UIs (this is agent-level protection only)
+- Commands executed outside of AI agents
+- Variants not in your keywords.txt
+
+If you encounter a false positive or false negative, check the logs and file an issue.
 
 ---
 

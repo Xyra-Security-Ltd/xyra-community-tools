@@ -7,6 +7,8 @@
 # blocks destructive operations specified in keywords.txt before they reach
 # any API or infrastructure provider.
 #
+# SAFE INSTALLATION: Preserves existing hooks and only removes ours on uninstall
+#
 # Usage:
 #   Manual:    bash install.sh
 #   Silent:    bash install.sh --silent
@@ -52,6 +54,7 @@ LOG_FILE="$HOOK_DIR/agent-hooks.log"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK_SOURCE="$SCRIPT_DIR/$TOOL_NAME.sh"
 KEYWORDS_FILE="$SCRIPT_DIR/keywords.txt"
+HOOK_MARKER="XYRA_BLOCK_HOOKS"
 SILENT=false
 UNINSTALL=false
 
@@ -79,44 +82,244 @@ log() {
 }
 
 # -----------------------------------------------------------------------------
+# Backup existing file
+# -----------------------------------------------------------------------------
+backup_file() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    local backup="${file}.backup.$(date +%Y%m%d-%H%M%S)"
+    cp "$file" "$backup"
+    log "INFO" "Backed up existing file to $backup"
+    return 0
+  fi
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# Merge hook into Cursor JSON config
+# Args: $1=config_file, $2=hook_command, $3=hook_type (beforeShellExecution|beforeMCPExecution)
+# -----------------------------------------------------------------------------
+merge_cursor_hook() {
+  local config_file="$1"
+  local hook_command="$2"
+  local hook_type="$3"
+  local marker="$HOOK_MARKER"
+
+  python3 - "$config_file" "$hook_command" "$hook_type" "$marker" << 'PYEOF'
+import sys, json, os
+
+config_file, hook_command, hook_type, marker = sys.argv[1:]
+
+# Read existing config or create new
+config = {"version": 1, "hooks": {}}
+if os.path.exists(config_file):
+    with open(config_file) as f:
+        try:
+            config = json.load(f)
+        except json.JSONDecodeError:
+            pass
+
+config.setdefault("hooks", {})
+config.setdefault("version", 1)
+config["hooks"].setdefault(hook_type, [])
+
+# Update existing or append
+hook_list = config["hooks"][hook_type]
+updated = False
+for h in hook_list:
+    if isinstance(h.get("command"), str) and marker in h["command"]:
+        h["command"] = hook_command
+        updated = True
+        break
+if not updated:
+    hook_list.append({"command": hook_command})
+
+with open(config_file, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Merge hook into Claude/Codex PreToolUse config
+# Args: $1=config_file, $2=matcher, $3=hook_command, $4=timeout (optional)
+# -----------------------------------------------------------------------------
+merge_pretooluse_hook() {
+  local config_file="$1"
+  local matcher="$2"
+  local hook_command="$3"
+  local timeout="${4:-}"
+  local marker="$HOOK_MARKER"
+
+  python3 - "$config_file" "$matcher" "$hook_command" "$timeout" "$marker" << 'PYEOF'
+import sys, json, os
+
+config_file, matcher, hook_command, timeout, marker = sys.argv[1:]
+
+# Read existing config or create new
+config = {"hooks": {}}
+if os.path.exists(config_file):
+    with open(config_file) as f:
+        try:
+            config = json.load(f)
+        except json.JSONDecodeError:
+            pass
+
+config.setdefault("hooks", {})
+config["hooks"].setdefault("PreToolUse", [])
+
+# Find or create the matcher entry
+matcher_entry = None
+for entry in config["hooks"]["PreToolUse"]:
+    if entry.get("matcher") == matcher:
+        matcher_entry = entry
+        break
+if matcher_entry is None:
+    matcher_entry = {"matcher": matcher, "hooks": []}
+    config["hooks"]["PreToolUse"].append(matcher_entry)
+
+matcher_entry.setdefault("hooks", [])
+
+# Build new hook object
+new_hook = {"type": "command", "command": hook_command}
+if timeout:
+    new_hook["timeout"] = int(timeout)
+
+# Update existing or append
+updated = False
+for h in matcher_entry["hooks"]:
+    if isinstance(h.get("command"), str) and marker in h["command"]:
+        h.update(new_hook)
+        updated = True
+        break
+if not updated:
+    matcher_entry["hooks"].append(new_hook)
+
+with open(config_file, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Remove our hooks from config file
+# Args: $1=config_file, $2=config_type (cursor|claude|codex)
+# Prints: DELETE | UPDATED | UNCHANGED
+# -----------------------------------------------------------------------------
+remove_hooks() {
+  local config_file="$1"
+  local config_type="$2"
+  local marker="$HOOK_MARKER"
+
+  if [[ ! -f "$config_file" ]]; then
+    return 0
+  fi
+
+  python3 - "$config_file" "$config_type" "$marker" << 'PYEOF'
+import sys, json, os
+
+config_file, config_type, marker = sys.argv[1:]
+
+with open(config_file) as f:
+    config = json.load(f)
+
+modified = False
+
+if config_type == "cursor":
+    hooks = config.get("hooks", {})
+    for key in ["beforeShellExecution", "beforeMCPExecution"]:
+        if key in hooks:
+            before = len(hooks[key])
+            hooks[key] = [h for h in hooks[key]
+                          if not (isinstance(h.get("command"), str) and marker in h["command"])]
+            if len(hooks[key]) != before:
+                modified = True
+            if not hooks[key]:
+                del hooks[key]
+    if not hooks:
+        config.pop("hooks", None)
+else:
+    pre = config.get("hooks", {}).get("PreToolUse", [])
+    for entry in pre:
+        if "hooks" in entry:
+            before = len(entry["hooks"])
+            entry["hooks"] = [h for h in entry["hooks"]
+                              if not (isinstance(h.get("command"), str) and marker in h["command"])]
+            if len(entry["hooks"]) != before:
+                modified = True
+    # Remove empty matcher entries
+    config.get("hooks", {}).get and None
+    if "hooks" in config and "PreToolUse" in config["hooks"]:
+        config["hooks"]["PreToolUse"] = [e for e in config["hooks"]["PreToolUse"]
+                                          if e.get("hooks")]
+        if not config["hooks"]["PreToolUse"]:
+            del config["hooks"]["PreToolUse"]
+        if not config["hooks"]:
+            del config["hooks"]
+
+# Determine if effectively empty
+def is_empty(cfg, cfg_type):
+    if cfg_type == "cursor":
+        keys = set(cfg.keys()) - {"version"}
+        return len(keys) == 0
+    return len(cfg) == 0
+
+if modified and is_empty(config, config_type):
+    print("DELETE")
+elif modified:
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    print("UPDATED")
+else:
+    print("UNCHANGED")
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
 # Uninstall
 # -----------------------------------------------------------------------------
 if [[ "$UNINSTALL" == true ]]; then
   log "INFO" "Uninstalling $TOOL_NAME hooks"
 
-  # Remove the primary hook script
+  # Remove hook script
   [[ -f "$HOOK_PATH" ]] && rm -f "$HOOK_PATH" && \
     log "INFO" "Removed hook script"
 
-  # Clean up any stale .sh files in the hook directory
-  if [[ -d "$HOOK_DIR" ]]; then
-    find "$HOOK_DIR" -maxdepth 1 -name "*.sh" -type f -exec rm -f {} \; 2>/dev/null || true
-    log "INFO" "Cleaned up stale hook files"
-  fi
-
+  # Remove our hooks from Cursor
   if [[ -f "$HOME/.cursor/hooks.json" ]]; then
-    rm -f "$HOME/.cursor/hooks.json"
-    log "INFO" "Removed Cursor hooks config"
+    result=$(remove_hooks "$HOME/.cursor/hooks.json" "cursor")
+    if [[ "$result" == "DELETE" ]]; then
+      rm -f "$HOME/.cursor/hooks.json"
+      log "INFO" "Removed Cursor config (no other hooks present)"
+    elif [[ "$result" == "UPDATED" ]]; then
+      log "INFO" "Removed Xyra hooks from Cursor (preserved other hooks)"
+    fi
   fi
 
+  # Remove our hooks from Claude Code
   if [[ -f "$HOME/.claude/settings.json" ]]; then
-    rm -f "$HOME/.claude/settings.json"
-    log "INFO" "Removed Claude Code hooks config"
+    result=$(remove_hooks "$HOME/.claude/settings.json" "claude")
+    if [[ "$result" == "DELETE" ]]; then
+      rm -f "$HOME/.claude/settings.json"
+      log "INFO" "Removed Claude Code config (no other settings present)"
+    elif [[ "$result" == "UPDATED" ]]; then
+      log "INFO" "Removed Xyra hooks from Claude Code (preserved other settings)"
+    fi
   fi
 
+  # Remove our hooks from Codex CLI
   if [[ -f "$HOME/.codex/hooks.json" ]]; then
-    rm -f "$HOME/.codex/hooks.json"
-    log "INFO" "Removed Codex CLI hooks config"
+    result=$(remove_hooks "$HOME/.codex/hooks.json" "codex")
+    if [[ "$result" == "DELETE" ]]; then
+      rm -f "$HOME/.codex/hooks.json"
+      log "INFO" "Removed Codex CLI config (no other hooks present)"
+    elif [[ "$result" == "UPDATED" ]]; then
+      log "INFO" "Removed Xyra hooks from Codex CLI (preserved other hooks)"
+    fi
   fi
 
   log "INFO" "Uninstall complete"
-  log "WARN" "Remember to fully quit and restart agents (Cursor, Codex, Claude) for changes to take effect"
-  if [[ "$SILENT" == false ]]; then
-    echo ""
-    echo "IMPORTANT: Fully quit and restart your agents:"
-    echo "  - Cursor: Press Cmd+Q, then relaunch"
-    echo "  - Codex/Claude CLI: Close all terminals, open new ones"
-  fi
   exit 0
 fi
 
@@ -178,14 +381,15 @@ log "INFO" "Installing $TOOL_NAME"
 mkdir -p "$HOOK_DIR"
 
 # Create hook script with injected keywords
-# Read source file and replace placeholder with generated patterns
 substitution_done=false
-{  # Add generation timestamp at the beginning
+{
+  # Add generation timestamp at the beginning
   echo "# Generated: $(date '+%Y-%m-%d %H:%M:%S')"
   echo "# Keywords: ${keywords[*]}"
   echo "# Total patterns: ${#keywords[@]}"
   echo ""
-    while IFS= read -r line; do
+  
+  while IFS= read -r line; do
     # Strip trailing whitespace for comparison
     line_trimmed="$(echo "$line" | sed 's/[[:space:]]*$//')"
     if [[ "$line_trimmed" == "# @@BLOCKED_KEYWORDS@@ - DO NOT REMOVE THIS LINE" ]]; then
@@ -236,103 +440,64 @@ command -v codex   >/dev/null 2>&1 && has_codex=true
 
 # -----------------------------------------------------------------------------
 # Cursor (desktop IDE)
-# Docs: https://cursor.com/docs/hooks
-# Config: ~/.cursor/hooks.json
-# beforeShellExecution: intercepts shell commands before execution
-# beforeMCPExecution: intercepts MCP tool calls before execution
-# Response: JSON on stdout with permission=allow|deny
 # -----------------------------------------------------------------------------
 if [[ "$has_cursor" == true ]]; then
   mkdir -p "$HOME/.cursor"
-  cat > "$HOME/.cursor/hooks.json" <<EOF
-{
-  "version": 1,
-  "hooks": {
-    "beforeShellExecution": [
-      { "command": "HOOK_ENV=cursor bash $HOOK_PATH" }
-    ],
-    "beforeMCPExecution": [
-      { "command": "HOOK_ENV=cursor bash $HOOK_PATH" }
-    ]
-  }
-}
-EOF
+  CURSOR_CONFIG="$HOME/.cursor/hooks.json"
+  
+  # Backup existing config
+  backup_file "$CURSOR_CONFIG"
+  
+  # Merge hooks
+  HOOK_CMD="HOOK_ENV=cursor bash $HOOK_PATH # $HOOK_MARKER"
+  merge_cursor_hook "$CURSOR_CONFIG" "$HOOK_CMD" "beforeShellExecution"
+  merge_cursor_hook "$CURSOR_CONFIG" "$HOOK_CMD" "beforeMCPExecution"
+  
   log "INFO" "Cursor (desktop IDE) hooks configured"
 fi
 
 # -----------------------------------------------------------------------------
 # Claude Code (CLI)
-# Docs: https://docs.anthropic.com/en/docs/claude-code/hooks
-# Config: ~/.claude/settings.json
-# PreToolUse: intercepts Bash and MCP tool calls before execution
-# Block: exit code 2, stderr is fed back to the agent
 # -----------------------------------------------------------------------------
 if [[ "$has_claude" == true ]]; then
   mkdir -p "$HOME/.claude"
-  cat > "$HOME/.claude/settings.json" <<EOF
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash|mcp__.*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $HOOK_PATH"
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF
+  CLAUDE_CONFIG="$HOME/.claude/settings.json"
+  
+  # Backup existing config
+  backup_file "$CLAUDE_CONFIG"
+  
+  # Merge hook
+  HOOK_CMD="bash $HOOK_PATH # $HOOK_MARKER"
+  merge_pretooluse_hook "$CLAUDE_CONFIG" "Bash|mcp__.*" "$HOOK_CMD"
+  
   log "INFO" "Claude Code (CLI) hooks configured"
 fi
 
 # -----------------------------------------------------------------------------
 # Codex CLI (OpenAI)
-# Docs: https://developers.openai.com/codex/hooks
-# Config: ~/.codex/hooks.json
-# PreToolUse: intercepts Bash commands before execution
-# Block: exit code 2, stderr is fed back to the agent
-# Note: Codex CLI PreToolUse currently only supports Bash interception.
-#       MCP tool call interception is not yet available in Codex CLI.
-# Note: requires [features] codex_hooks = true in ~/.codex/config.toml
 # -----------------------------------------------------------------------------
 if [[ "$has_codex" == true ]]; then
   mkdir -p "$HOME/.codex"
-
-  # Write hooks.json
-  cat > "$HOME/.codex/hooks.json" <<EOF
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $HOOK_PATH",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF
-
+  CODEX_CONFIG="$HOME/.codex/hooks.json"
+  
+  # Backup existing config
+  backup_file "$CODEX_CONFIG"
+  
+  # Merge hook
+  HOOK_CMD="bash $HOOK_PATH # $HOOK_MARKER"
+  merge_pretooluse_hook "$CODEX_CONFIG" "Bash" "$HOOK_CMD" "30"
+  
   # Enable hooks feature flag in config.toml
   CONFIG_FILE="$HOME/.codex/config.toml"
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    cat > "$CONFIG_FILE" <<EOF
+    cat > "$CONFIG_FILE" <<'TOML'
 [features]
 codex_hooks = true
-EOF
+TOML
   elif ! grep -q "codex_hooks" "$CONFIG_FILE"; then
     printf "\n[features]\ncodex_hooks = true\n" >> "$CONFIG_FILE"
   fi
-
+  
   log "INFO" "Codex CLI (OpenAI) hooks configured"
 fi
 
@@ -348,6 +513,7 @@ if [[ "$SILENT" == false ]]; then
   [[ "$has_claude" == true ]] && echo "✔ Claude Code (CLI) hooks installed"
   [[ "$has_codex"  == true ]] && echo "✔ Codex CLI (OpenAI) hooks installed"
   echo "✔ Logging enabled at $LOG_FILE"
+  echo "✔ Existing hooks preserved (backups created)"
 
   if [[ "$has_cursor" == false ]] && \
      [[ "$has_claude" == false ]] && \
@@ -358,21 +524,12 @@ if [[ "$SILENT" == false ]]; then
   fi
 
   echo ""
-  echo "============================================================"
-  echo "IMPORTANT: Fully QUIT and restart your agents"
-  echo "============================================================"
+  echo "IMPORTANT: Restart your AI agent or start a new terminal session"
+  echo "           for the hooks to take effect."
   echo ""
-  echo "Agents cache hooks in memory. You MUST fully quit:"
-  echo ""
-  [[ "$has_cursor" == true ]] && echo "  Cursor:      Press Cmd+Q (not just close window), then relaunch"
-  [[ "$has_claude" == true ]] && echo "  Claude CLI:  Close all terminals, open new one, run 'claude'"
-  [[ "$has_codex"  == true ]] && echo "  Codex CLI:   Close all terminals, open new one, run 'codex'"
-  echo ""
-  echo "After restarting:"
-  echo "  Verify logs: tail -f $LOG_FILE"
-  echo "  Debug hook:  cat ~/.agent-hooks/block-hooks.sh | grep -A 5 'is_blocked()'"
-  echo "  Uninstall:   bash install.sh --uninstall"
-  echo "============================================================"
+  echo "To verify:    tail -f $LOG_FILE"
+  echo "To debug:     cat ~/.agent-hooks/block-hooks.sh | grep -A 5 'is_blocked()'"
+  echo "To uninstall: bash install.sh --uninstall"
 fi
 
 exit 0
