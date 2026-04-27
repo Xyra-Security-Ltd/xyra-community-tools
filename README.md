@@ -19,13 +19,13 @@ These tools are independent of the Xyra platform. No account required. No teleme
 
 ## Tools
 
-### hooks/block-delete-volume
+### hooks/block-hooks
 
-Installs a pre-execution hook on Cursor, Claude Code, and Codex that intercepts shell commands and MCP tool calls before they run. Blocks any `volumeDelete` operation regardless of how it's invoked.
+Installs a pre-execution hook on Cursor, Claude Code, and Codex that intercepts shell commands and MCP tool calls before they run. Blocks destructive operations based on configurable keywords defined in `keywords.txt`.
 
 **Motivation:** On April 23, 2026, a Cursor agent running Claude Opus 4.6 deleted a production database and all volume-level backups in a single 9-second API call. The agent violated its own safety rules and produced a written confession afterward. This hook would have blocked the operation before it fired.
 
-[Read more and install](./hooks/block-delete-volume/README.md)
+[Read more and install](./hooks/block-hooks/README.md)
 
 ---
 
@@ -36,6 +36,14 @@ System prompts are advisory. Models read the rules, acknowledge them, and someti
 These tools operate at the execution layer.
 
 They are not a replacement for a full AI security platform. They are a first line of defense that any team can deploy in minutes, for free, without vendor lock-in.
+
+---
+
+## Disclaimer
+
+These tools are provided "as is" without warranty of any kind. Use at your own risk. Xyra Security Ltd. and contributors are not liable for any damages, data loss, or security incidents that occur while using these tools.
+
+These tools provide one layer of defense and do not replace proper security practices including access controls, token scoping, backups, monitoring, and human review of critical operations. Test thoroughly before production deployment.
 
 ---
 

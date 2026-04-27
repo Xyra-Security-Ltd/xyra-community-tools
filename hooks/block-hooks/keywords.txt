@@ -1,0 +1,20 @@
+# Xyra Community Tools - Blocked Keywords
+# One keyword per line. Lines starting with # are ignored.
+# 
+# These keywords are checked against all shell commands and MCP tool calls.
+# Matching is case-sensitive substring matching - be specific to minimize
+# false positives.
+#
+# To add a keyword: add a new line with the exact string to block
+# To disable a keyword: add # at the start of the line
+# After editing: run `bash install.sh` to apply changes
+
+# Volume deletion operations (Railway, AWS, GCP, Azure)
+volumeDelete
+deleteVolume
+volume-delete
+volume_delete
+VOLUMEDELETE
+DELETE-VOLUME
+DELETE_VOLUME
+VolumeDelete
