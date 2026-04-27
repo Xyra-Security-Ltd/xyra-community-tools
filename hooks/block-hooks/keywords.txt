@@ -1,0 +1,29 @@
+# Xyra Community Tools - Blocked Keywords
+# One keyword per line. Lines starting with # are ignored.
+# 
+# These keywords are checked against shell commands and MCP tool calls.
+# Matching uses EXACT TOKEN MATCHING - not substring matching.
+# This means "delete" will NOT match "deleteVolume" or "undelete".
+#
+# Examples of what gets matched:
+#   Keyword: deleteVolume
+#   ✓ Blocks: echo "deleteVolume"
+#   ✓ Blocks: deleteVolume myvolume
+#   ✗ Allows: deleteVolumeNow (different token)
+#   ✗ Allows: mydeleteVolume (different token)
+#
+# To add a keyword: add a new line with the exact string to block
+# To disable a keyword: add # at the start of the line
+# After editing: run `bash install.sh` to apply changes
+#
+# IMPORTANT: Keywords are case-sensitive!
+
+# Example: Block volume deletion operations
+volumeDelete
+deleteVolume
+volume-delete
+volume_delete
+VOLUMEDELETE
+DELETE-VOLUME
+DELETE_VOLUME
+VolumeDelete
